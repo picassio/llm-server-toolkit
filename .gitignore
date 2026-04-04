@@ -1,0 +1,36 @@
+# Build artifacts
+build/
+
+# Model files
+*.gguf
+
+# Cache directories
+.cache/
+1/
+
+# Benchmark results (generated)
+benchmark-results/
+
+# Temp files
+*.incomplete
+*.tmp
+
+# OS files
+.DS_Store
+
+# Secrets / credentials (NEVER commit)
+.credentials
+*.pem
+*.key
+tunnel-info
+*.json
+
+# Generated review
+REVIEW.md
+
+# Editor files
+*.swp
+*.swo
+*~
+.vscode/
+.idea/
