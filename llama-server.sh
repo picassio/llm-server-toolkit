@@ -1,18 +1,41 @@
 #!/usr/bin/env bash
 # Start/stop/manage llama-server via tmux or systemd
+# Supports both inference (chat) and embedding modes
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "$SCRIPT_DIR/lib/common.sh"
 setup_traps
 
-TMUX_SESSION="llama"
-SERVICE_NAME="llama-server"
-PORT_FILE="/tmp/llama-server.port"
-CONFIG_FILE="/tmp/llama-server.conf"
+# ─── Server role config ───────────────────────────────────────────────────────
+# These get set based on --embedding flag
+SERVER_ROLE=""  # "inference" or "embedding"
+
+set_role() {
+    local role="${1:-inference}"
+    SERVER_ROLE="$role"
+    if [[ "$role" == "embedding" ]]; then
+        TMUX_SESSION="llama-embed"
+        SERVICE_NAME="llama-embedding"
+        PORT_FILE="/tmp/llama-embedding.port"
+        CONFIG_FILE="/tmp/llama-embedding.conf"
+        DEFAULT_PORT="8001"
+        DEFAULT_CONTEXT="32768"
+    else
+        TMUX_SESSION="llama"
+        SERVICE_NAME="llama-server"
+        PORT_FILE="/tmp/llama-server.port"
+        CONFIG_FILE="/tmp/llama-server.conf"
+        DEFAULT_PORT="8000"
+        DEFAULT_CONTEXT="262144"
+    fi
+    UNIT_FILE="/etc/systemd/system/${SERVICE_NAME}.service"
+}
+
+# Default to inference
+set_role "inference"
 
 # ─── Detect run mode ──────────────────────────────────────────────────────────
-# Persisted in CONFIG_FILE so stop/restart/status/logs know which mode is active
 detect_mode() {
     if [[ -f "$CONFIG_FILE" ]]; then
         # shellcheck source=/dev/null
@@ -44,19 +67,60 @@ Usage: $0 {start|stop|restart|status|logs|enable|disable}
   start    - Interactive setup and start llama-server
   stop     - Gracefully stop the running server
   restart  - Stop then start the server
-  status   - Check server health
+  status   - Check server health (shows both inference & embedding)
   logs     - Show server logs
   enable   - Enable systemd auto-start on boot (systemd mode only)
   disable  - Disable systemd auto-start on boot (systemd mode only)
 
 Options (for start):
-  --tmux      Run in tmux session (default)
-  --systemd   Run as systemd service (survives reboots, auto-restarts)
+  --tmux        Run in tmux session (default)
+  --systemd     Run as systemd service (survives reboots, auto-restarts)
+  --embedding   Start an embedding server instead of inference server
+
+Examples:
+  $0 start                        # interactive inference server
+  $0 start --systemd              # inference via systemd
+  $0 start --embedding --systemd  # embedding server via systemd
+  $0 stop --embedding             # stop embedding server
+  $0 status                       # show all servers
 EOF
     exit 1
 }
 
-# ─── Interactive configuration (shared between both modes) ─────────────────────
+# ─── Embedding model definitions ──────────────────────────────────────────────
+# Model name → dimensions, context, pooling
+declare -A EMBED_DIMS=(
+    ["Qwen3-Embedding-0.6B"]=1024
+    ["Qwen3-Embedding-4B"]=2560
+    ["Qwen3-Embedding-8B"]=4096
+)
+declare -A EMBED_CTX=(
+    ["Qwen3-Embedding-0.6B"]=32768
+    ["Qwen3-Embedding-4B"]=32768
+    ["Qwen3-Embedding-8B"]=32768
+)
+declare -A EMBED_POOLING=(
+    ["Qwen3-Embedding-0.6B"]="last"
+    ["Qwen3-Embedding-4B"]="last"
+    ["Qwen3-Embedding-8B"]="last"
+)
+declare -A EMBED_HF_REPO=(
+    ["Qwen3-Embedding-0.6B"]="Qwen/Qwen3-Embedding-0.6B-GGUF"
+    ["Qwen3-Embedding-4B"]="Qwen/Qwen3-Embedding-4B-GGUF"
+    ["Qwen3-Embedding-8B"]="Qwen/Qwen3-Embedding-8B-GGUF"
+)
+declare -A EMBED_HF_FILE=(
+    ["Qwen3-Embedding-0.6B"]="Qwen3-Embedding-0.6B-Q8_0.gguf"
+    ["Qwen3-Embedding-4B"]="Qwen3-Embedding-4B-Q8_0.gguf"
+    ["Qwen3-Embedding-8B"]="Qwen3-Embedding-8B-Q8_0.gguf"
+)
+declare -A EMBED_SIZE=(
+    ["Qwen3-Embedding-0.6B"]="640MB"
+    ["Qwen3-Embedding-4B"]="4.1GB"
+    ["Qwen3-Embedding-8B"]="8.1GB"
+)
+
+# ─── Interactive configuration ─────────────────────────────────────────────────
 gather_config() {
     # Find server binary
     SERVER_BIN=""
@@ -70,6 +134,182 @@ gather_config() {
     fi
     log_info "Server binary: $SERVER_BIN"
 
+    if [[ "$SERVER_ROLE" == "embedding" ]]; then
+        gather_embedding_config
+    else
+        gather_inference_config
+    fi
+}
+
+gather_embedding_config() {
+    echo ""
+    echo "=== Embedding Model Setup ==="
+    echo ""
+    echo "Available embedding models:"
+    echo "  1) Qwen3-Embedding-0.6B  (${EMBED_SIZE[Qwen3-Embedding-0.6B]}, dim=${EMBED_DIMS[Qwen3-Embedding-0.6B]}, fast)"
+    echo "  2) Qwen3-Embedding-4B    (${EMBED_SIZE[Qwen3-Embedding-4B]}, dim=${EMBED_DIMS[Qwen3-Embedding-4B]}, better quality)"
+    echo "  3) Qwen3-Embedding-8B    (${EMBED_SIZE[Qwen3-Embedding-8B]}, dim=${EMBED_DIMS[Qwen3-Embedding-8B]}, best quality)"
+    echo "  4) Custom GGUF file"
+    echo ""
+    read -r -p "Select embedding model [1]: " EMBED_CHOICE
+    EMBED_CHOICE="${EMBED_CHOICE:-1}"
+
+    local embed_key=""
+    case "$EMBED_CHOICE" in
+        1) embed_key="Qwen3-Embedding-0.6B" ;;
+        2) embed_key="Qwen3-Embedding-4B" ;;
+        3) embed_key="Qwen3-Embedding-8B" ;;
+        4)
+            # Custom model — fall through to manual config
+            gather_embedding_config_custom
+            return
+            ;;
+        *) log_error "Invalid choice"; exit 1 ;;
+    esac
+
+    MODEL_NAME="$embed_key"
+    EMBED_DIM="${EMBED_DIMS[$embed_key]}"
+    CONTEXT="${EMBED_CTX[$embed_key]}"
+    POOLING="${EMBED_POOLING[$embed_key]}"
+
+    local gguf_file="${EMBED_HF_FILE[$embed_key]}"
+    MODEL="$HOME/models/$gguf_file"
+
+    # Download if not present
+    if [[ ! -f "$MODEL" ]]; then
+        log_info "Model not found locally. Downloading..."
+        local hf_repo="${EMBED_HF_REPO[$embed_key]}"
+        mkdir -p "$HOME/models"
+
+        if command -v hf &>/dev/null; then
+            hf download "$hf_repo" "$gguf_file" --local-dir "$HOME/models"
+        elif command -v huggingface-cli &>/dev/null; then
+            huggingface-cli download "$hf_repo" "$gguf_file" --local-dir "$HOME/models"
+        else
+            log_error "HuggingFace CLI not found. Install: pip install huggingface_hub"
+            exit 1
+        fi
+
+        if [[ ! -f "$MODEL" ]]; then
+            log_error "Download failed."
+            exit 1
+        fi
+        log_success "Downloaded: $gguf_file"
+    else
+        log_success "Model found: $MODEL"
+    fi
+
+    # Port
+    read -r -p "Port [$DEFAULT_PORT]: " PORT
+    PORT="${PORT:-$DEFAULT_PORT}"
+    if ! validate_numeric "$PORT" "Port"; then exit 1; fi
+
+    # Parallel slots
+    read -r -p "Parallel slots [4]: " PARALLEL
+    PARALLEL="${PARALLEL:-4}"
+    if ! validate_numeric "$PARALLEL" "Parallel slots"; then exit 1; fi
+
+    # GPU detection
+    NUM_GPUS=$(detect_gpu_count)
+    TS_ARGS=()
+    if [[ "$NUM_GPUS" -gt 1 ]]; then
+        TS_ARGS=(-ts "1,0")  # Embedding model is small, single GPU is fine
+    fi
+    GPU_MODE="single"
+
+    # Build command
+    CMD_ARGS=(
+        "$SERVER_BIN"
+        -m "$MODEL"
+        -ngl 99
+        -c "$CONTEXT"
+        -np "$PARALLEL"
+        --embedding
+        --pooling "$POOLING"
+        --alias "$MODEL_NAME"
+        --host 0.0.0.0
+        --port "$PORT"
+    )
+    if [[ ${#TS_ARGS[@]} -gt 0 ]]; then
+        CMD_ARGS+=("${TS_ARGS[@]}")
+    fi
+
+    KV_CACHE="n/a"
+
+    echo ""
+    log_info "Embedding config:"
+    echo "  Model:      $MODEL_NAME"
+    echo "  Dimensions: $EMBED_DIM"
+    echo "  Context:    $CONTEXT"
+    echo "  Pooling:    $POOLING"
+}
+
+gather_embedding_config_custom() {
+    echo ""
+    log_info "Scanning for models..."
+    mapfile -t MODELS < <(find_models)
+    if [[ ${#MODELS[@]} -eq 0 ]]; then
+        log_error "No GGUF models found. Download one first."
+        exit 1
+    fi
+
+    echo "Available models:"
+    for i in "${!MODELS[@]}"; do
+        SIZE=$(format_file_size "${MODELS[$i]}")
+        NAME=$(basename "${MODELS[$i]}")
+        echo "  $((i+1))) $NAME ($SIZE)"
+    done
+    echo ""
+    read -r -p "Select model: " MODEL_CHOICE
+    if ! validate_numeric "$MODEL_CHOICE" "Model selection"; then exit 1; fi
+    if ! validate_range "$MODEL_CHOICE" 1 "${#MODELS[@]}" "Model selection"; then exit 1; fi
+
+    MODEL="${MODELS[$((MODEL_CHOICE-1))]}"
+    MODEL_NAME=$(basename "$MODEL" .gguf)
+
+    read -r -p "Embedding dimensions [1024]: " EMBED_DIM
+    EMBED_DIM="${EMBED_DIM:-1024}"
+
+    read -r -p "Context length [32768]: " CONTEXT
+    CONTEXT="${CONTEXT:-32768}"
+
+    echo "Pooling types: mean, cls, last"
+    read -r -p "Pooling type [last]: " POOLING
+    POOLING="${POOLING:-last}"
+
+    read -r -p "Port [$DEFAULT_PORT]: " PORT
+    PORT="${PORT:-$DEFAULT_PORT}"
+    if ! validate_numeric "$PORT" "Port"; then exit 1; fi
+
+    read -r -p "Parallel slots [4]: " PARALLEL
+    PARALLEL="${PARALLEL:-4}"
+
+    NUM_GPUS=$(detect_gpu_count)
+    TS_ARGS=()
+    if [[ "$NUM_GPUS" -gt 1 ]]; then
+        TS_ARGS=(-ts "1,0")
+    fi
+    GPU_MODE="single"
+    KV_CACHE="n/a"
+
+    CMD_ARGS=(
+        "$SERVER_BIN"
+        -m "$MODEL"
+        -ngl 99
+        -c "$CONTEXT"
+        -np "$PARALLEL"
+        --embedding
+        --pooling "$POOLING"
+        --alias "$MODEL_NAME"
+        --host 0.0.0.0
+        --port "$PORT"
+    )
+    if [[ ${#TS_ARGS[@]} -gt 0 ]]; then
+        CMD_ARGS+=("${TS_ARGS[@]}")
+    fi
+}
+
+gather_inference_config() {
     # Find and select model
     echo ""
     log_info "Scanning for models..."
@@ -125,8 +365,8 @@ gather_config() {
     fi
 
     # Context size
-    read -r -p "Context size [262144]: " CONTEXT
-    CONTEXT="${CONTEXT:-262144}"
+    read -r -p "Context size [$DEFAULT_CONTEXT]: " CONTEXT
+    CONTEXT="${CONTEXT:-$DEFAULT_CONTEXT}"
     if ! validate_numeric "$CONTEXT" "Context size"; then exit 1; fi
 
     # KV cache type
@@ -136,8 +376,8 @@ gather_config() {
     KV_CACHE="${KV_CACHE:-q8_0}"
 
     # Port
-    read -r -p "Port [8000]: " PORT
-    PORT="${PORT:-8000}"
+    read -r -p "Port [$DEFAULT_PORT]: " PORT
+    PORT="${PORT:-$DEFAULT_PORT}"
     if ! validate_numeric "$PORT" "Port"; then exit 1; fi
 
     # Parallel slots
@@ -164,7 +404,7 @@ gather_config() {
     fi
 }
 
-# Save config so stop/restart/status know what mode and port we're using
+# ─── Config persistence ───────────────────────────────────────────────────────
 save_config() {
     local mode="$1"
     cat > "$CONFIG_FILE" <<EOF
@@ -172,32 +412,49 @@ LLAMA_MODE=$mode
 LLAMA_PORT=$PORT
 LLAMA_MODEL=$MODEL_NAME
 LLAMA_SERVER_BIN=$SERVER_BIN
+LLAMA_ROLE=$SERVER_ROLE
 EOF
 }
 
 print_summary() {
     echo ""
-    echo "=== Starting llama-server ==="
-    echo "Model:    $MODEL_NAME"
-    echo "GPU:      $GPU_MODE"
-    echo "Context:  $CONTEXT"
-    echo "KV cache: $KV_CACHE"
-    echo "Port:     $PORT"
-    echo "Mode:     $RUN_MODE"
+    if [[ "$SERVER_ROLE" == "embedding" ]]; then
+        echo "=== Starting Embedding Server ==="
+        echo "Model:      $MODEL_NAME"
+        echo "Dimensions: ${EMBED_DIM:-auto}"
+        echo "Context:    $CONTEXT"
+        echo "Pooling:    ${POOLING:-last}"
+        echo "Port:       $PORT"
+        echo "Mode:       $RUN_MODE"
+    else
+        echo "=== Starting Inference Server ==="
+        echo "Model:    $MODEL_NAME"
+        echo "GPU:      $GPU_MODE"
+        echo "Context:  $CONTEXT"
+        echo "KV cache: $KV_CACHE"
+        echo "Port:     $PORT"
+        echo "Mode:     $RUN_MODE"
+    fi
     echo ""
 }
 
 show_post_start_info() {
     local mode="$1"
-    log_success "=== Server ready at http://0.0.0.0:${PORT} ==="
-    log_info "API endpoint: http://0.0.0.0:${PORT}/v1/chat/completions"
-    log_info "Health check: http://0.0.0.0:${PORT}/health"
+
+    if [[ "$SERVER_ROLE" == "embedding" ]]; then
+        log_success "=== Embedding server ready at http://0.0.0.0:${PORT} ==="
+        log_info "Endpoint:  http://0.0.0.0:${PORT}/v1/embeddings"
+    else
+        log_success "=== Server ready at http://0.0.0.0:${PORT} ==="
+        log_info "Endpoint:  http://0.0.0.0:${PORT}/v1/chat/completions"
+    fi
+    log_info "Health:    http://0.0.0.0:${PORT}/health"
 
     if [[ "$mode" == "tmux" ]]; then
-        log_info "Attach to logs: tmux attach -t $TMUX_SESSION"
+        log_info "Logs:      tmux attach -t $TMUX_SESSION"
     else
-        log_info "View logs: journalctl -u $SERVICE_NAME -f"
-        log_info "Auto-start on boot: bash llama-server.sh enable"
+        log_info "Logs:      journalctl -u $SERVICE_NAME -f"
+        log_info "Auto-boot: bash llama-server.sh enable${SERVER_ROLE:+ --$SERVER_ROLE}"
     fi
 
     # New API gateway info
@@ -206,7 +463,11 @@ show_post_start_info() {
         na_port=$(get_new_api_port)
         echo ""
         log_info "New API gateway detected on port $na_port"
-        log_info "Proxy endpoint: http://0.0.0.0:${na_port}/v1/chat/completions"
+        if [[ "$SERVER_ROLE" == "embedding" ]]; then
+            log_info "Proxy endpoint: http://0.0.0.0:${na_port}/v1/embeddings"
+        else
+            log_info "Proxy endpoint: http://0.0.0.0:${na_port}/v1/chat/completions"
+        fi
         log_info "Manage channels: bash new-api.sh add-channel"
     fi
 }
@@ -282,13 +543,11 @@ start_tmux() {
 
 stop_tmux() {
     if tmux has-session -t "$TMUX_SESSION" 2>/dev/null; then
-        # Graceful: Ctrl+C first
         tmux send-keys -t "$TMUX_SESSION" C-c 2>/dev/null || true
         for _ in $(seq 1 10); do
             if ! tmux has-session -t "$TMUX_SESSION" 2>/dev/null; then break; fi
             sleep 1
         done
-        # Force kill if still running
         if tmux has-session -t "$TMUX_SESSION" 2>/dev/null; then
             tmux kill-session -t "$TMUX_SESSION" 2>/dev/null || true
         fi
@@ -297,8 +556,6 @@ stop_tmux() {
 }
 
 # ─── systemd mode ─────────────────────────────────────────────────────────────
-UNIT_FILE="/etc/systemd/system/${SERVICE_NAME}.service"
-
 require_sudo() {
     if ! sudo -n true 2>/dev/null; then
         log_info "sudo access required for systemd service management."
@@ -324,7 +581,6 @@ start_systemd() {
     # Build ExecStart command string
     local exec_start=""
     for arg in "${CMD_ARGS[@]}"; do
-        # Escape spaces/special chars for systemd
         if [[ "$arg" == *" "* || "$arg" == *"'"* ]]; then
             exec_start+="\"$arg\" "
         else
@@ -345,11 +601,14 @@ start_systemd() {
         ld_lib_path="Environment=LD_LIBRARY_PATH=$(dirname "$cuda_path")/lib64"
     fi
 
+    local description="llama.cpp Inference Server ($MODEL_NAME)"
+    [[ "$SERVER_ROLE" == "embedding" ]] && description="llama.cpp Embedding Server ($MODEL_NAME)"
+
     # Write systemd unit file
-    log_info "Creating systemd service..."
+    log_info "Creating systemd service: $SERVICE_NAME"
     sudo tee "$UNIT_FILE" > /dev/null <<EOF
 [Unit]
-Description=llama.cpp Inference Server ($MODEL_NAME)
+Description=$description
 After=network.target
 Wants=network-online.target
 
@@ -394,7 +653,7 @@ EOF
     echo "$PORT" > "$PORT_FILE"
     save_config "systemd"
 
-    log_success "Systemd service created and started"
+    log_success "Systemd service '$SERVICE_NAME' created and started"
 }
 
 stop_systemd() {
@@ -408,17 +667,17 @@ stop_systemd() {
 enable_systemd() {
     require_sudo
     if [[ ! -f "$UNIT_FILE" ]]; then
-        log_error "No systemd service found. Start with: $0 start --systemd"
+        log_error "No systemd service '$SERVICE_NAME' found. Start with: $0 start --${SERVER_ROLE} --systemd"
         exit 1
     fi
     sudo systemctl enable "$SERVICE_NAME"
-    log_success "llama-server will auto-start on boot"
+    log_success "$SERVICE_NAME will auto-start on boot"
 }
 
 disable_systemd() {
     require_sudo
     sudo systemctl disable "$SERVICE_NAME" 2>/dev/null || true
-    log_success "llama-server auto-start disabled"
+    log_success "$SERVICE_NAME auto-start disabled"
 }
 
 # ─── Unified commands ─────────────────────────────────────────────────────────
@@ -455,11 +714,11 @@ stop_server() {
     mode=$(detect_mode)
 
     if [[ -z "$mode" ]]; then
-        log_info "Server is not running"
+        log_info "$SERVICE_NAME is not running"
         return
     fi
 
-    log_info "Stopping server ($mode mode)..."
+    log_info "Stopping $SERVICE_NAME ($mode mode)..."
 
     case "$mode" in
         tmux)    stop_tmux ;;
@@ -467,11 +726,10 @@ stop_server() {
     esac
 
     rm -f "$CONFIG_FILE"
-    log_success "Server stopped"
+    log_success "$SERVICE_NAME stopped"
 }
 
 restart_server() {
-    # Remember the mode from the running instance
     local prev_mode
     prev_mode=$(detect_mode)
 
@@ -484,50 +742,75 @@ restart_server() {
     start_server
 }
 
-show_status() {
-    local mode
-    mode=$(detect_mode)
+show_single_status() {
+    local role="$1" svc_name="$2" session="$3" pfile="$4" cfile="$5"
+    local mode=""
+    local label="Inference"
+    [[ "$role" == "embedding" ]] && label="Embedding"
+
+    # Detect mode for this service
+    if [[ -f "$cfile" ]]; then
+        # shellcheck source=/dev/null
+        source "$cfile"
+        mode="${LLAMA_MODE:-}"
+    fi
+    if [[ -z "$mode" ]] && systemctl is-active --quiet "$svc_name" 2>/dev/null; then
+        mode="systemd"
+    fi
+    if [[ -z "$mode" ]] && tmux has-session -t "$session" 2>/dev/null; then
+        mode="tmux"
+    fi
 
     if [[ -z "$mode" ]]; then
-        log_info "Server is not running"
+        log_info "$label server: not running"
         return
     fi
 
-    if [[ "$mode" == "tmux" ]]; then
-        log_success "Server is running (tmux session: $TMUX_SESSION)"
-    else
-        log_success "Server is running (systemd service: $SERVICE_NAME)"
+    local mode_detail=""
+    if [[ "$mode" == "systemd" ]]; then
         local enabled="disabled"
-        systemctl is-enabled --quiet "$SERVICE_NAME" 2>/dev/null && enabled="enabled"
-        log_info "Auto-start on boot: $enabled"
+        systemctl is-enabled --quiet "$svc_name" 2>/dev/null && enabled="enabled"
+        mode_detail="systemd, boot=$enabled"
+    else
+        mode_detail="tmux session: $session"
     fi
 
+    # Find port
+    local port=""
+    if [[ -f "$pfile" ]]; then
+        port=$(cat "$pfile")
+    fi
+    # Fallback ports
+    if [[ -z "$port" ]]; then
+        [[ "$role" == "embedding" ]] && port="8001" || port="8000"
+    fi
+
+    if curl -sf "http://127.0.0.1:${port}/health" &>/dev/null; then
+        log_success "$label server: running ($mode_detail, port $port)"
+    else
+        log_warn "$label server: process active but not responding ($mode_detail, port $port)"
+    fi
+}
+
+show_status() {
+    echo "=== llama-server status ==="
     echo ""
 
-    # Read saved port, or try common ports
-    local ports=()
-    if [[ -f "$PORT_FILE" ]]; then
-        ports+=("$(cat "$PORT_FILE")")
+    # Show inference server status
+    show_single_status "inference" "llama-server" "llama" "/tmp/llama-server.port" "/tmp/llama-server.conf"
+
+    # Show embedding server status
+    show_single_status "embedding" "llama-embedding" "llama-embed" "/tmp/llama-embedding.port" "/tmp/llama-embedding.conf"
+
+    # New API gateway
+    echo ""
+    if is_new_api_running; then
+        local na_port
+        na_port=$(get_new_api_port)
+        log_success "New API gateway: running (port $na_port)"
+    else
+        log_info "New API gateway: not running"
     fi
-    ports+=(8000 8080)
-
-    for port in "${ports[@]}"; do
-        HEALTH=$(curl -sf "http://127.0.0.1:${port}/health" 2>/dev/null || true)
-        if [[ -n "$HEALTH" ]]; then
-            log_info "Listening on port $port"
-            echo "$HEALTH" | python3 -m json.tool 2>/dev/null || echo "$HEALTH"
-
-            # New API gateway status
-            if is_new_api_running; then
-                local na_port
-                na_port=$(get_new_api_port)
-                echo ""
-                log_success "New API gateway: running (port $na_port)"
-            fi
-            return
-        fi
-    done
-    log_warn "Server not responding on checked ports (${ports[*]})"
 }
 
 show_logs() {
@@ -542,7 +825,7 @@ show_logs() {
             journalctl -u "$SERVICE_NAME" -n 50 --no-pager
             ;;
         *)
-            log_info "Server is not running"
+            log_info "$SERVICE_NAME is not running"
             ;;
     esac
 }
@@ -553,8 +836,9 @@ ACTION=""
 
 for arg in "$@"; do
     case "$arg" in
-        --tmux)    RUN_MODE="tmux" ;;
-        --systemd) RUN_MODE="systemd" ;;
+        --tmux)      RUN_MODE="tmux" ;;
+        --systemd)   RUN_MODE="systemd" ;;
+        --embedding) set_role "embedding" ;;
         start|stop|restart|status|logs|enable|disable)
             ACTION="$arg" ;;
         *)
