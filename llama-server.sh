@@ -605,18 +605,132 @@ show_post_start_info() {
         log_info "Auto-boot: bash llama-server.sh enable${SERVER_ROLE:+ --$SERVER_ROLE}"
     fi
 
-    # New API gateway info
+    # New API auto-registration
     if is_new_api_running; then
         local na_port
         na_port=$(get_new_api_port)
         echo ""
-        log_info "New API gateway detected on port $na_port"
+        register_with_new_api "$na_port"
+    fi
+}
+
+# ─── New API auto-registration ─────────────────────────────────────────────────
+register_with_new_api() {
+    local na_port="$1"
+    local channel_name="" model_alias=""
+
+    case "$SERVER_ROLE" in
+        embedding)  channel_name="Local Embedding Server"; model_alias="$MODEL_NAME" ;;
+        reranking)  channel_name="Local Reranker Server";  model_alias="$MODEL_NAME" ;;
+        *)          channel_name="Local Inference Server";  model_alias="$MODEL_NAME" ;;
+    esac
+
+    # Check if this model is already registered
+    local existing
+    existing=$(docker exec new-api-postgres psql -U newapi -d new-api -t -A \
+        -c "SELECT COUNT(*) FROM channels WHERE models LIKE '%${model_alias}%' AND status = 1;" 2>/dev/null || echo "0")
+
+    if [[ "$existing" -gt 0 ]]; then
+        log_success "New API: '$model_alias' already registered"
+        local endpoint=""
         case "$SERVER_ROLE" in
-            embedding)  log_info "Proxy endpoint: http://0.0.0.0:${na_port}/v1/embeddings" ;;
-            reranking)  log_info "Proxy endpoint: http://0.0.0.0:${na_port}/v1/rerank" ;;
-            *)          log_info "Proxy endpoint: http://0.0.0.0:${na_port}/v1/chat/completions" ;;
+            embedding)  endpoint="/v1/embeddings" ;;
+            reranking)  endpoint="/v1/rerank" ;;
+            *)          endpoint="/v1/chat/completions" ;;
         esac
-        log_info "Manage channels: bash new-api.sh add-channel"
+        log_info "Proxy endpoint: http://0.0.0.0:${na_port}${endpoint}"
+        return
+    fi
+
+    # Offer to register
+    if confirm "Register '$model_alias' with New API gateway?" "Y"; then
+        # Get admin credentials
+        local admin_pass=""
+        if [[ -f "$HOME/new-api/.credentials" ]]; then
+            admin_pass=$(grep NEW_API_ADMIN_PASS "$HOME/new-api/.credentials" 2>/dev/null | cut -d= -f2)
+        fi
+        if [[ -z "$admin_pass" ]]; then
+            local admin_user
+            admin_user=$(docker exec new-api-postgres psql -U newapi -d new-api -t -A \
+                -c "SELECT username FROM users WHERE role = 100 LIMIT 1;" 2>/dev/null)
+            read -r -s -p "New API admin password for '$admin_user': " admin_pass
+            echo ""
+        fi
+
+        local admin_user
+        admin_user=$(docker exec new-api-postgres psql -U newapi -d new-api -t -A \
+            -c "SELECT username FROM users WHERE role = 100 LIMIT 1;" 2>/dev/null)
+
+        # Login
+        local cookie_jar
+        cookie_jar=$(mktemp /tmp/newapi-reg-XXXXXX)
+        curl -s -c "$cookie_jar" "http://127.0.0.1:${na_port}/api/user/login" \
+            -H "Content-Type: application/json" \
+            -d "{\"username\":\"$admin_user\",\"password\":\"$admin_pass\"}" > /dev/null 2>&1
+
+        local admin_id
+        admin_id=$(docker exec new-api-postgres psql -U newapi -d new-api -t -A \
+            -c "SELECT id FROM users WHERE role = 100 LIMIT 1;" 2>/dev/null)
+
+        # Detect Docker gateway IP for backend URL
+        local gateway_ip
+        gateway_ip=$(docker network inspect new-api_new-api-network 2>/dev/null | \
+            python3 -c "import json,sys; print(json.load(sys.stdin)[0]['IPAM']['Config'][0]['Gateway'])" 2>/dev/null || echo "172.17.0.1")
+
+        # Create channel
+        local resp
+        resp=$(curl -s -b "$cookie_jar" "http://127.0.0.1:${na_port}/api/channel/" \
+            -H "New-Api-User: $admin_id" \
+            -H "Content-Type: application/json" \
+            -X POST \
+            -d "{
+                \"mode\": \"multi_to_single\",
+                \"channel\": {
+                    \"name\": \"$channel_name\",
+                    \"type\": 1,
+                    \"key\": \"no-key-needed\",
+                    \"base_url\": \"http://${gateway_ip}:${PORT}\",
+                    \"models\": \"$model_alias\",
+                    \"model_mapping\": \"\",
+                    \"group\": \"default,vip,svip\",
+                    \"priority\": 1,
+                    \"status\": 1,
+                    \"weight\": 1
+                }
+            }")
+
+        if echo "$resp" | python3 -c "import json,sys; assert json.load(sys.stdin)['success']" 2>/dev/null; then
+            # Register model metadata
+            local tags="local"
+            case "$SERVER_ROLE" in
+                embedding)  tags="local,embedding" ;;
+                reranking)  tags="local,reranker" ;;
+                *)          tags="local,inference" ;;
+            esac
+            curl -s -b "$cookie_jar" "http://127.0.0.1:${na_port}/api/models/" \
+                -H "New-Api-User: $admin_id" \
+                -H "Content-Type: application/json" \
+                -X POST \
+                -d "{\"model_name\":\"$model_alias\",\"description\":\"Local $SERVER_ROLE model\",\"tags\":\"$tags\",\"status\":1,\"name_rule\":0}" > /dev/null 2>&1 || true
+
+            # Restart New API to pick up the new channel
+            docker restart new-api > /dev/null 2>&1 || true
+
+            log_success "Registered '$model_alias' with New API"
+            local endpoint=""
+            case "$SERVER_ROLE" in
+                embedding)  endpoint="/v1/embeddings" ;;
+                reranking)  endpoint="/v1/rerank" ;;
+                *)          endpoint="/v1/chat/completions" ;;
+            esac
+            log_info "Proxy endpoint: http://0.0.0.0:${na_port}${endpoint}"
+        else
+            log_warn "Failed to register with New API. Register manually: bash new-api.sh add-channel"
+        fi
+
+        rm -f "$cookie_jar"
+    else
+        log_info "Register later: bash new-api.sh add-channel"
     fi
 }
 
