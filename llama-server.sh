@@ -8,27 +8,38 @@ source "$SCRIPT_DIR/lib/common.sh"
 setup_traps
 
 # ─── Server role config ───────────────────────────────────────────────────────
-# These get set based on --embedding flag
-SERVER_ROLE=""  # "inference" or "embedding"
+# These get set based on --embedding / --reranking flag
+SERVER_ROLE=""  # "inference", "embedding", or "reranking"
 
 set_role() {
     local role="${1:-inference}"
     SERVER_ROLE="$role"
-    if [[ "$role" == "embedding" ]]; then
-        TMUX_SESSION="llama-embed"
-        SERVICE_NAME="llama-embedding"
-        PORT_FILE="/tmp/llama-embedding.port"
-        CONFIG_FILE="/tmp/llama-embedding.conf"
-        DEFAULT_PORT="8001"
-        DEFAULT_CONTEXT="32768"
-    else
-        TMUX_SESSION="llama"
-        SERVICE_NAME="llama-server"
-        PORT_FILE="/tmp/llama-server.port"
-        CONFIG_FILE="/tmp/llama-server.conf"
-        DEFAULT_PORT="8000"
-        DEFAULT_CONTEXT="262144"
-    fi
+    case "$role" in
+        embedding)
+            TMUX_SESSION="llama-embed"
+            SERVICE_NAME="llama-embedding"
+            PORT_FILE="/tmp/llama-embedding.port"
+            CONFIG_FILE="/tmp/llama-embedding.conf"
+            DEFAULT_PORT="8001"
+            DEFAULT_CONTEXT="32768"
+            ;;
+        reranking)
+            TMUX_SESSION="llama-rerank"
+            SERVICE_NAME="llama-reranking"
+            PORT_FILE="/tmp/llama-reranking.port"
+            CONFIG_FILE="/tmp/llama-reranking.conf"
+            DEFAULT_PORT="8002"
+            DEFAULT_CONTEXT="32768"
+            ;;
+        *)
+            TMUX_SESSION="llama"
+            SERVICE_NAME="llama-server"
+            PORT_FILE="/tmp/llama-server.port"
+            CONFIG_FILE="/tmp/llama-server.conf"
+            DEFAULT_PORT="8000"
+            DEFAULT_CONTEXT="262144"
+            ;;
+    esac
     UNIT_FILE="/etc/systemd/system/${SERVICE_NAME}.service"
 }
 
@@ -76,13 +87,16 @@ Options (for start):
   --tmux        Run in tmux session (default)
   --systemd     Run as systemd service (survives reboots, auto-restarts)
   --embedding   Start an embedding server instead of inference server
+  --reranking   Start a reranker server instead of inference server
 
 Examples:
-  $0 start                        # interactive inference server
-  $0 start --systemd              # inference via systemd
-  $0 start --embedding --systemd  # embedding server via systemd
-  $0 stop --embedding             # stop embedding server
-  $0 status                       # show all servers
+  $0 start                         # interactive inference server
+  $0 start --systemd               # inference via systemd
+  $0 start --embedding --systemd   # embedding server via systemd
+  $0 start --reranking --systemd   # reranker server via systemd
+  $0 stop --embedding              # stop embedding server
+  $0 stop --reranking              # stop reranker server
+  $0 status                        # show all servers
 EOF
     exit 1
 }
@@ -120,6 +134,28 @@ declare -A EMBED_SIZE=(
     ["Qwen3-Embedding-8B"]="8.1GB"
 )
 
+# ─── Reranker model definitions ─────────────────────────────────────────
+declare -A RERANK_CTX=(
+    ["Qwen3-Reranker-0.6B"]=32768
+    ["Qwen3-Reranker-4B"]=32768
+    ["Qwen3-Reranker-8B"]=32768
+)
+declare -A RERANK_HF_REPO=(
+    ["Qwen3-Reranker-0.6B"]="ggml-org/Qwen3-Reranker-0.6B-Q8_0-GGUF"
+    ["Qwen3-Reranker-4B"]="dean2155/Qwen3-Reranker-4B-Q8_0-GGUF"
+    ["Qwen3-Reranker-8B"]="dean2155/Qwen3-Reranker-8B-Q8_0-GGUF"
+)
+declare -A RERANK_HF_FILE=(
+    ["Qwen3-Reranker-0.6B"]="qwen3-reranker-0.6b-q8_0.gguf"
+    ["Qwen3-Reranker-4B"]="Qwen3-Reranker-4B-Q8_0.gguf"
+    ["Qwen3-Reranker-8B"]="Qwen3-Reranker-8B-Q8_0.gguf"
+)
+declare -A RERANK_SIZE=(
+    ["Qwen3-Reranker-0.6B"]="640MB"
+    ["Qwen3-Reranker-4B"]="4.1GB"
+    ["Qwen3-Reranker-8B"]="8.1GB"
+)
+
 # ─── Interactive configuration ─────────────────────────────────────────────────
 gather_config() {
     # Find server binary
@@ -134,11 +170,11 @@ gather_config() {
     fi
     log_info "Server binary: $SERVER_BIN"
 
-    if [[ "$SERVER_ROLE" == "embedding" ]]; then
-        gather_embedding_config
-    else
-        gather_inference_config
-    fi
+    case "$SERVER_ROLE" in
+        embedding)  gather_embedding_config ;;
+        reranking)  gather_reranking_config ;;
+        *)          gather_inference_config ;;
+    esac
 }
 
 gather_embedding_config() {
@@ -309,6 +345,100 @@ gather_embedding_config_custom() {
     fi
 }
 
+gather_reranking_config() {
+    echo ""
+    echo "=== Reranker Model Setup ==="
+    echo ""
+    echo "Available reranker models:"
+    echo "  1) Qwen3-Reranker-0.6B  (${RERANK_SIZE[Qwen3-Reranker-0.6B]}, fast)"
+    echo "  2) Qwen3-Reranker-4B    (${RERANK_SIZE[Qwen3-Reranker-4B]}, better quality)"
+    echo "  3) Qwen3-Reranker-8B    (${RERANK_SIZE[Qwen3-Reranker-8B]}, best quality)"
+    echo ""
+    read -r -p "Select reranker model [1]: " RERANK_CHOICE
+    RERANK_CHOICE="${RERANK_CHOICE:-1}"
+
+    local rerank_key=""
+    case "$RERANK_CHOICE" in
+        1) rerank_key="Qwen3-Reranker-0.6B" ;;
+        2) rerank_key="Qwen3-Reranker-4B" ;;
+        3) rerank_key="Qwen3-Reranker-8B" ;;
+        *) log_error "Invalid choice"; exit 1 ;;
+    esac
+
+    MODEL_NAME="$rerank_key"
+    CONTEXT="${RERANK_CTX[$rerank_key]}"
+
+    local gguf_file="${RERANK_HF_FILE[$rerank_key]}"
+    MODEL="$HOME/models/$gguf_file"
+
+    # Download if not present
+    if [[ ! -f "$MODEL" ]]; then
+        log_info "Model not found locally. Downloading..."
+        local hf_repo="${RERANK_HF_REPO[$rerank_key]}"
+        mkdir -p "$HOME/models"
+
+        if command -v hf &>/dev/null; then
+            hf download "$hf_repo" "$gguf_file" --local-dir "$HOME/models"
+        elif command -v huggingface-cli &>/dev/null; then
+            huggingface-cli download "$hf_repo" "$gguf_file" --local-dir "$HOME/models"
+        else
+            log_error "HuggingFace CLI not found. Install: pip install huggingface_hub"
+            exit 1
+        fi
+
+        if [[ ! -f "$MODEL" ]]; then
+            log_error "Download failed."
+            exit 1
+        fi
+        log_success "Downloaded: $gguf_file"
+    else
+        log_success "Model found: $MODEL"
+    fi
+
+    # Port
+    read -r -p "Port [$DEFAULT_PORT]: " PORT
+    PORT="${PORT:-$DEFAULT_PORT}"
+    if ! validate_numeric "$PORT" "Port"; then exit 1; fi
+
+    # Parallel slots
+    read -r -p "Parallel slots [4]: " PARALLEL
+    PARALLEL="${PARALLEL:-4}"
+    if ! validate_numeric "$PARALLEL" "Parallel slots"; then exit 1; fi
+
+    # GPU detection
+    NUM_GPUS=$(detect_gpu_count)
+    TS_ARGS=()
+    if [[ "$NUM_GPUS" -gt 1 ]]; then
+        TS_ARGS=(-ts "1,0")
+    fi
+    GPU_MODE="single"
+    KV_CACHE="n/a"
+    EMBED_DIM=""
+
+    # Build command
+    CMD_ARGS=(
+        "$SERVER_BIN"
+        -m "$MODEL"
+        -ngl 99
+        -c "$CONTEXT"
+        -np "$PARALLEL"
+        --reranking
+        --pooling rank
+        --alias "$MODEL_NAME"
+        --host 0.0.0.0
+        --port "$PORT"
+    )
+    if [[ ${#TS_ARGS[@]} -gt 0 ]]; then
+        CMD_ARGS+=("${TS_ARGS[@]}")
+    fi
+
+    echo ""
+    log_info "Reranker config:"
+    echo "  Model:   $MODEL_NAME"
+    echo "  Context: $CONTEXT"
+    echo "  Pooling: rank"
+}
+
 gather_inference_config() {
     # Find and select model
     echo ""
@@ -418,36 +548,54 @@ EOF
 
 print_summary() {
     echo ""
-    if [[ "$SERVER_ROLE" == "embedding" ]]; then
-        echo "=== Starting Embedding Server ==="
-        echo "Model:      $MODEL_NAME"
-        echo "Dimensions: ${EMBED_DIM:-auto}"
-        echo "Context:    $CONTEXT"
-        echo "Pooling:    ${POOLING:-last}"
-        echo "Port:       $PORT"
-        echo "Mode:       $RUN_MODE"
-    else
-        echo "=== Starting Inference Server ==="
-        echo "Model:    $MODEL_NAME"
-        echo "GPU:      $GPU_MODE"
-        echo "Context:  $CONTEXT"
-        echo "KV cache: $KV_CACHE"
-        echo "Port:     $PORT"
-        echo "Mode:     $RUN_MODE"
-    fi
+    case "$SERVER_ROLE" in
+        embedding)
+            echo "=== Starting Embedding Server ==="
+            echo "Model:      $MODEL_NAME"
+            echo "Dimensions: ${EMBED_DIM:-auto}"
+            echo "Context:    $CONTEXT"
+            echo "Pooling:    ${POOLING:-last}"
+            echo "Port:       $PORT"
+            echo "Mode:       $RUN_MODE"
+            ;;
+        reranking)
+            echo "=== Starting Reranker Server ==="
+            echo "Model:   $MODEL_NAME"
+            echo "Context: $CONTEXT"
+            echo "Pooling: rank"
+            echo "Port:    $PORT"
+            echo "Mode:    $RUN_MODE"
+            ;;
+        *)
+            echo "=== Starting Inference Server ==="
+            echo "Model:    $MODEL_NAME"
+            echo "GPU:      $GPU_MODE"
+            echo "Context:  $CONTEXT"
+            echo "KV cache: $KV_CACHE"
+            echo "Port:     $PORT"
+            echo "Mode:     $RUN_MODE"
+            ;;
+    esac
     echo ""
 }
 
 show_post_start_info() {
     local mode="$1"
 
-    if [[ "$SERVER_ROLE" == "embedding" ]]; then
-        log_success "=== Embedding server ready at http://0.0.0.0:${PORT} ==="
-        log_info "Endpoint:  http://0.0.0.0:${PORT}/v1/embeddings"
-    else
-        log_success "=== Server ready at http://0.0.0.0:${PORT} ==="
-        log_info "Endpoint:  http://0.0.0.0:${PORT}/v1/chat/completions"
-    fi
+    case "$SERVER_ROLE" in
+        embedding)
+            log_success "=== Embedding server ready at http://0.0.0.0:${PORT} ==="
+            log_info "Endpoint:  http://0.0.0.0:${PORT}/v1/embeddings"
+            ;;
+        reranking)
+            log_success "=== Reranker server ready at http://0.0.0.0:${PORT} ==="
+            log_info "Endpoint:  http://0.0.0.0:${PORT}/v1/rerank"
+            ;;
+        *)
+            log_success "=== Server ready at http://0.0.0.0:${PORT} ==="
+            log_info "Endpoint:  http://0.0.0.0:${PORT}/v1/chat/completions"
+            ;;
+    esac
     log_info "Health:    http://0.0.0.0:${PORT}/health"
 
     if [[ "$mode" == "tmux" ]]; then
@@ -463,11 +611,11 @@ show_post_start_info() {
         na_port=$(get_new_api_port)
         echo ""
         log_info "New API gateway detected on port $na_port"
-        if [[ "$SERVER_ROLE" == "embedding" ]]; then
-            log_info "Proxy endpoint: http://0.0.0.0:${na_port}/v1/embeddings"
-        else
-            log_info "Proxy endpoint: http://0.0.0.0:${na_port}/v1/chat/completions"
-        fi
+        case "$SERVER_ROLE" in
+            embedding)  log_info "Proxy endpoint: http://0.0.0.0:${na_port}/v1/embeddings" ;;
+            reranking)  log_info "Proxy endpoint: http://0.0.0.0:${na_port}/v1/rerank" ;;
+            *)          log_info "Proxy endpoint: http://0.0.0.0:${na_port}/v1/chat/completions" ;;
+        esac
         log_info "Manage channels: bash new-api.sh add-channel"
     fi
 }
@@ -747,6 +895,7 @@ show_single_status() {
     local mode=""
     local label="Inference"
     [[ "$role" == "embedding" ]] && label="Embedding"
+    [[ "$role" == "reranking" ]] && label="Reranker"
 
     # Detect mode for this service
     if [[ -f "$cfile" ]]; then
@@ -796,11 +945,10 @@ show_status() {
     echo "=== llama-server status ==="
     echo ""
 
-    # Show inference server status
-    show_single_status "inference" "llama-server" "llama" "/tmp/llama-server.port" "/tmp/llama-server.conf"
-
-    # Show embedding server status
-    show_single_status "embedding" "llama-embedding" "llama-embed" "/tmp/llama-embedding.port" "/tmp/llama-embedding.conf"
+    # Show all server statuses
+    show_single_status "inference"  "llama-server"    "llama"        "/tmp/llama-server.port"    "/tmp/llama-server.conf"
+    show_single_status "embedding"  "llama-embedding" "llama-embed"  "/tmp/llama-embedding.port" "/tmp/llama-embedding.conf"
+    show_single_status "reranking"  "llama-reranking" "llama-rerank" "/tmp/llama-reranking.port" "/tmp/llama-reranking.conf"
 
     # New API gateway
     echo ""
@@ -839,6 +987,7 @@ for arg in "$@"; do
         --tmux)      RUN_MODE="tmux" ;;
         --systemd)   RUN_MODE="systemd" ;;
         --embedding) set_role "embedding" ;;
+        --reranking) set_role "reranking" ;;
         start|stop|restart|status|logs|enable|disable)
             ACTION="$arg" ;;
         *)
