@@ -33,6 +33,7 @@ Ensure these tools are available on your system:
 | `cleanup.sh` | Free disk space (Docker, models, caches) with dry-run mode | user |
 | `new-api.sh` | Manage New API gateway (setup/start/stop/channels/tokens) | user |
 | `cloudflared.sh` | Manage Cloudflare Tunnel for HTTPS access | user |
+| `vllm-server.sh` | Manage vLLM inference server (Docker or native) | user |
 
 ### Shared Library
 
@@ -251,6 +252,46 @@ curl http://localhost:3000/v1/chat/completions \
 ```
 
 The Web UI is available at `http://localhost:3000` for visual management of channels, tokens, and usage statistics.
+
+## vLLM Server (High-Throughput Alternative)
+
+[vLLM](https://github.com/vllm-project/vllm) provides high-throughput batched inference with continuous batching, PagedAttention, and tensor parallelism. Use instead of llama.cpp when you need:
+- High concurrency (10+ simultaneous users)
+- FP8 quantization (Hopper/Blackwell GPUs)
+- Native HuggingFace model support (no GGUF conversion)
+
+### Setup
+
+```bash
+# Interactive setup (Docker recommended)
+bash vllm-server.sh start
+
+# Includes presets for:
+#   Qwen3.6-27B-FP8    — 256K ctx, ~200 t/s on GB10
+#   Qwen3.6-27B-BF16   — 131K ctx, for Ampere/Ada GPUs
+#   Gemma-4-26B-A4B    — MoE, efficient
+#   Custom models      — any HuggingFace model
+```
+
+### Management
+
+```bash
+bash vllm-server.sh status    # health + GPU usage + loaded models
+bash vllm-server.sh logs      # view server logs
+bash vllm-server.sh stop      # stop server
+bash vllm-server.sh restart   # restart
+```
+
+### Performance Reference (Qwen3.6-27B-FP8 on GB10)
+
+| Metric | Value |
+|--------|-------|
+| Context | 256K tokens |
+| Concurrent agents | 10 |
+| Max decode | ~200 t/s |
+| Average decode | ~136 t/s |
+| Power | 49W |
+| Optimizations | Dflash + DDTree |
 
 ## Cloudflare Tunnel (Public HTTPS Access)
 
