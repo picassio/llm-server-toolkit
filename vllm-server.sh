@@ -48,16 +48,21 @@ EOF
 }
 
 # ─── Model Presets ────────────────────────────────────────────────────────────
-# Format: "display_name|hf_repo|max_ctx|dtype|extra_args|description"
+# Format: "display_name|hf_repo|max_ctx|dtype|extra_args|reasoning_parser|description"
 PRESETS=(
-    "Qwen3.6-27B-FP8|Qwen/Qwen3-30B-A3B-FP8|262144|auto|--enable-prefix-caching --enable-chunked-prefill|MoE 30B/3B, FP8, 256K ctx (needs Hopper/Blackwell GPU)"
-    "Qwen3.6-27B-BF16|Qwen/Qwen3-30B-A3B|131072|bfloat16|--enable-prefix-caching --enable-chunked-prefill|MoE 30B/3B, BF16, 131K ctx"
-    "Qwen3.5-27B-FP8|Qwen/Qwen3.5-32B-FP8|131072|auto|--enable-prefix-caching|Dense 32B, FP8 (needs Hopper/Blackwell)"
-    "Qwen3.5-27B-BF16|Qwen/Qwen3.5-32B|65536|bfloat16|--enable-prefix-caching|Dense 32B, BF16"
-    "Gemma-4-26B-A4B|google/gemma-4-26B-A4B-it|131072|bfloat16|--enable-prefix-caching --enable-chunked-prefill|MoE 26B/4B, BF16"
-    "Gemma-4-31B|google/gemma-4-31B-it|131072|bfloat16|--enable-prefix-caching|Dense 31B, BF16"
-    "Custom|custom|0|auto||Enter a custom HuggingFace model"
+    "Qwen3.6-27B-AWQ|cyankiwi/Qwen3.6-27B-AWQ-INT4|131072|auto|--enable-prefix-caching --enable-chunked-prefill --quantization compressed-tensors|qwen3|MoE AWQ-INT4, 131K ctx (recommended for Ampere)"
+    "Qwen3.6-27B-FP8|Qwen/Qwen3-30B-A3B-FP8|262144|auto|--enable-prefix-caching --enable-chunked-prefill|qwen3|MoE 30B/3B, FP8, 256K ctx (needs Hopper/Blackwell)"
+    "Qwen3.6-27B-BF16|Qwen/Qwen3-30B-A3B|131072|bfloat16|--enable-prefix-caching --enable-chunked-prefill|qwen3|MoE 30B/3B, BF16, 131K ctx"
+    "Qwen3.5-27B-FP8|Qwen/Qwen3.5-32B-FP8|131072|auto|--enable-prefix-caching|qwen3|Dense 32B, FP8 (needs Hopper/Blackwell)"
+    "Qwen3.5-27B-BF16|Qwen/Qwen3.5-32B|65536|bfloat16|--enable-prefix-caching|qwen3|Dense 32B, BF16"
+    "Gemma-4-26B-A4B|google/gemma-4-26B-A4B-it|131072|bfloat16|--enable-prefix-caching --enable-chunked-prefill|gemma4|MoE 26B/4B, BF16"
+    "Gemma-4-31B|google/gemma-4-31B-it|131072|bfloat16|--enable-prefix-caching|gemma4|Dense 31B, BF16"
+    "Custom|custom|0|auto|||Enter a custom HuggingFace model"
 )
+
+# Reasoning parsers: maps model family to vLLM reasoning parser name
+# These separate <think>...</think> into reasoning_content field
+# Available: qwen3, deepseek_r1, deepseek_v3, gemma4, granite, mistral, etc.
 
 # ─── Detect GPU capabilities ─────────────────────────────────────────────────
 get_gpu_arch() {
@@ -112,10 +117,10 @@ gather_config() {
     echo ""
     echo "Available model presets:"
     for i in "${!PRESETS[@]}"; do
-        IFS='|' read -r name _ _ dtype _ desc <<< "${PRESETS[$i]}"
+        IFS='|' read -r name _ _ dtype _ _ desc <<< "${PRESETS[$i]}"
         local fp8_note=""
-        if [[ "$dtype" == "auto" ]] && ! supports_fp8; then
-            fp8_note=" ⚠️  (FP8 — may not work on this GPU)"
+        if [[ "$desc" == *"FP8"* ]] && ! supports_fp8; then
+            fp8_note=" ⚠️  (needs Hopper/Blackwell GPU)"
         fi
         printf "  %d) %-25s %s%s\n" "$((i+1))" "$name" "$desc" "$fp8_note"
     done
@@ -127,7 +132,7 @@ gather_config() {
     if ! validate_range "$MODEL_CHOICE" 1 "${#PRESETS[@]}" "Model selection"; then exit 1; fi
 
     local preset="${PRESETS[$((MODEL_CHOICE-1))]}"
-    IFS='|' read -r PRESET_NAME HF_MODEL MAX_CTX DTYPE EXTRA_ARGS PRESET_DESC <<< "$preset"
+    IFS='|' read -r PRESET_NAME HF_MODEL MAX_CTX DTYPE EXTRA_ARGS REASONING_PARSER PRESET_DESC <<< "$preset"
 
     # Custom model
     if [[ "$HF_MODEL" == "custom" ]]; then
@@ -142,6 +147,10 @@ gather_config() {
         read -r -p "Data type [bfloat16]: " DTYPE
         DTYPE="${DTYPE:-bfloat16}"
         EXTRA_ARGS="--enable-prefix-caching"
+        echo "Reasoning parser (separates thinking from response):"
+        echo "  qwen3, deepseek_r1, gemma4, granite, mistral, or empty for none"
+        read -r -p "Reasoning parser []: " REASONING_PARSER
+        REASONING_PARSER="${REASONING_PARSER:-}"
         PRESET_NAME="$HF_MODEL"
     fi
 
@@ -252,6 +261,11 @@ start_docker() {
         vllm_args+=($EXTRA_ARGS)
     fi
 
+    # Add reasoning parser (separates <think> into reasoning_content)
+    if [[ -n "${REASONING_PARSER:-}" ]]; then
+        vllm_args+=(--reasoning-parser "$REASONING_PARSER")
+    fi
+
     # Run
     echo ""
     log_step "Starting vLLM container..."
@@ -297,6 +311,9 @@ start_native() {
     exec_start+=" --host 0.0.0.0 --port $PORT"
     if [[ -n "$EXTRA_ARGS" ]]; then
         exec_start+=" $EXTRA_ARGS"
+    fi
+    if [[ -n "${REASONING_PARSER:-}" ]]; then
+        exec_start+=" --reasoning-parser $REASONING_PARSER"
     fi
 
     # Find CUDA path
