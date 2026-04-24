@@ -34,6 +34,7 @@ Ensure these tools are available on your system:
 | `new-api.sh` | Manage New API gateway (setup/start/stop/channels/tokens) | user |
 | `cloudflared.sh` | Manage Cloudflare Tunnel for HTTPS access | user |
 | `vllm-server.sh` | Manage vLLM inference server (Docker or native) | user |
+| `dflash-server.sh` | Manage DFlash+DDTree speculative decoding server | user |
 
 ### Shared Library
 
@@ -252,6 +253,31 @@ curl http://localhost:3000/v1/chat/completions \
 ```
 
 The Web UI is available at `http://localhost:3000` for visual management of channels, tokens, and usage statistics.
+
+## DFlash Server (Fastest Single-User Decoding)
+
+[Luce DFlash + DDTree](https://github.com/Luce-Org/lucebox-hub) provides speculative decoding on top of llama.cpp GGUF models. A tiny draft model proposes multiple tokens per step, verified by the target in one forward pass.
+
+### Setup
+
+```bash
+bash dflash-server.sh setup    # clone, build, download models (~20GB)
+bash dflash-server.sh start    # start OpenAI-compatible server
+bash dflash-server.sh bench    # run HumanEval/GSM8K/Math500 benchmarks
+```
+
+### Performance (Qwen3.5-27B Q4_K_M, single RTX 3090)
+
+| Benchmark | Autoregressive | DFlash+DDTree | Speedup |
+|-----------|---------------|---------------|---------|
+| HumanEval | 37.8 t/s | **91.4 t/s** | **2.83×** |
+| Math500 | 37.7 t/s | **78.6 t/s** | **2.45×** |
+| GSM8K | 37.7 t/s | **72.7 t/s** | **2.26×** |
+
+- Uses only **1 GPU** (16GB target + 3.5GB draft)
+- 128K context in 24GB with Q4 KV cache
+- OpenAI + Anthropic API compatible
+- Auto-registers with New API gateway
 
 ## vLLM Server (High-Throughput Alternative)
 
