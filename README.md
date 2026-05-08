@@ -33,7 +33,7 @@ Ensure these tools are available on your system:
 | `cleanup.sh` | Free disk space (Docker, models, caches) with dry-run mode | user |
 | `new-api.sh` | Manage New API gateway (setup/start/stop/channels/tokens) | user |
 | `cloudflared.sh` | Manage Cloudflare Tunnel for HTTPS access | user |
-| `vllm-server.sh` | Manage vLLM inference server (Docker or native) | user |
+| `vllm-server.sh` | Manage vLLM inference server (Docker, native, or turbo) | user |
 | `dflash-server.sh` | Manage DFlash+DDTree speculative decoding server | user |
 
 ### Shared Library
@@ -286,17 +286,26 @@ bash dflash-server.sh bench    # run HumanEval/GSM8K/Math500 benchmarks
 - FP8 quantization (Hopper/Blackwell GPUs)
 - Native HuggingFace model support (no GGUF conversion)
 
+Three execution modes:
+- **Docker** — generic vLLM image (default)
+- **Native** — pip-installed vLLM
+- **Turbo** (`--turbo`) — club-3090 Docker Compose with Genesis patches, TurboQuant KV cache, and MTP speculative decoding (optimized for dual RTX 3090)
+
 ### Setup
 
 ```bash
 # Interactive setup (Docker recommended)
 bash vllm-server.sh start
 
+# Turbo mode — optimized for dual RTX 3090
+bash vllm-server.sh start --turbo
+
 # Includes presets for:
-#   Qwen3.6-27B-FP8    — 256K ctx, ~200 t/s on GB10
-#   Qwen3.6-27B-BF16   — 131K ctx, for Ampere/Ada GPUs
-#   Gemma-4-26B-A4B    — MoE, efficient
-#   Custom models      — any HuggingFace model
+#   Qwen3.6-27B-FP8        — 256K ctx, ~200 t/s on GB10
+#   Qwen3.6-27B-BF16       — 131K ctx, for Ampere/Ada GPUs
+#   Qwen3.6-27B-TurboQuant — 196K ctx, INT4 AutoRound for dual RTX 3090 (turbo mode)
+#   Gemma-4-26B-A4B        — MoE, efficient
+#   Custom models          — any HuggingFace model
 ```
 
 ### Management
@@ -318,6 +327,17 @@ bash vllm-server.sh restart   # restart
 | Average decode | ~136 t/s |
 | Power | 49W |
 | Optimizations | Dflash + DDTree |
+
+### Performance Reference (Qwen3.6-27B-TurboQuant on dual RTX 3090)
+
+| Metric | Value |
+|--------|-------|
+| Context | 196K tokens |
+| Quantization | INT4 AutoRound (Lorbus/Qwen3.6-27B-int4-AutoRound) |
+| Tensor Parallelism | 2 GPUs |
+| KV Cache | TurboQuant FP16 |
+| Speculative Decoding | MTP (Multi-Token Prediction) |
+| Optimizations | Genesis patches + club-3090 docker-compose |
 
 ## Cloudflare Tunnel (Public HTTPS Access)
 

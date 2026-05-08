@@ -14,6 +14,12 @@ CONFIG_FILE="/tmp/vllm-server.conf"
 DEFAULT_PORT="8000"
 DEFAULT_IMAGE="vllm/vllm-openai:latest"
 
+# Turbo mode (club-3090 Docker + Genesis + TurboQuant)
+TURBO_CONTAINER_NAME="vllm-qwen36-27b-dual-turbo"
+TURBO_COMPOSE_DIR="$HOME/club-3090/models/qwen3.6-27b/vllm/compose"
+TURBO_COMPOSE_FILE="docker-compose.dual-turbo.yml"
+TURBO_DEFAULT_PORT="8011"
+
 usage() {
     cat <<EOF
 Usage: $0 {start|stop|restart|status|logs}
@@ -27,14 +33,16 @@ Usage: $0 {start|stop|restart|status|logs}
 Options:
   --docker    Run via Docker (default, recommended)
   --native    Run via pip-installed vLLM (requires manual install)
+  --turbo     Run via club-3090 Docker + Genesis + TurboQuant (RTX 3090)
 
 Model presets:
   The script includes optimized presets for common models.
   Custom HuggingFace models are also supported.
 
 Examples:
-  $0 start                          # interactive Docker setup
+  $0 start                          # interactive setup
   $0 start --docker                 # Docker mode
+  $0 start --turbo                  # Turbo mode (RTX 3090)
   $0 stop                           # stop server
   $0 status                         # check health
 
@@ -43,6 +51,12 @@ Performance reference (Qwen3.6-27B-FP8 on GB10):
   - ~200 tokens/sec max decode
   - ~136 t/s average at 49W
   - Requires: Dflash + DDTree optimizations
+
+Performance reference (Qwen3.6-27B-TurboQuant on 2x RTX 3090):
+  - 262K context, 4 concurrent streams
+  - ~73 t/s code / ~54 t/s narrative per stream
+  - TurboQuant 3bit KV + MTP n=3 + Genesis patches
+  - AutoRound INT4 quantization
 EOF
     exit 1
 }
@@ -57,6 +71,7 @@ PRESETS=(
     "Qwen3.5-27B-BF16|Qwen/Qwen3.5-32B|65536|bfloat16|--enable-prefix-caching|qwen3|Dense 32B, BF16"
     "Gemma-4-26B-A4B|google/gemma-4-26B-A4B-it|131072|bfloat16|--enable-prefix-caching --enable-chunked-prefill|gemma4|MoE 26B/4B, BF16"
     "Gemma-4-31B|google/gemma-4-31B-it|131072|bfloat16|--enable-prefix-caching|gemma4|Dense 31B, BF16"
+    "Qwen3.6-27B-TurboQuant|Lorbus/Qwen3.6-27B-int4-AutoRound|196608|float16||qwen3|AutoRound INT4 + TurboQuant 3bit KV + MTP n=3 (Turbo mode only, recommended for 2x RTX 3090)"
     "Custom|custom|0|auto|||Enter a custom HuggingFace model"
 )
 
@@ -207,6 +222,71 @@ VLLM_PORT=$PORT
 VLLM_MODEL=$HF_MODEL
 VLLM_ALIAS=$MODEL_ALIAS
 EOF
+}
+
+# ─── Turbo Config ─────────────────────────────────────────────────────────────
+gather_turbo_config() {
+    echo "=== vLLM TurboQuant Server Setup ==="
+    echo ""
+    echo "Mode: Turbo (club-3090 Docker + Genesis + TurboQuant KV + MTP)"
+    echo "Model: Lorbus/Qwen3.6-27B-int4-AutoRound (fixed)"
+    echo ""
+
+    # GPU info
+    echo "GPUs:"
+    detect_gpu_names
+    NUM_GPUS=$(detect_gpu_count)
+    if [[ "$NUM_GPUS" -lt 2 ]]; then
+        log_warn "Turbo mode is designed for 2 GPUs (detected: $NUM_GPUS)"
+        log_warn "Continuing anyway — compose will use available GPUs"
+    fi
+
+    # HuggingFace token
+    HF_TOKEN=""
+    if [[ -f "$HOME/.cache/huggingface/token" ]]; then
+        HF_TOKEN=$(cat "$HOME/.cache/huggingface/token")
+        log_success "HuggingFace token found"
+    else
+        read -r -p "HuggingFace token (leave empty to skip): " HF_TOKEN
+    fi
+
+    # Fixed model settings (controlled by compose file)
+    HF_MODEL="Lorbus/Qwen3.6-27B-int4-AutoRound"
+    PRESET_NAME="Qwen3.6-27B-TurboQuant"
+    REASONING_PARSER="qwen3"
+    DTYPE="float16"
+    TP_SIZE="2"
+    MAX_SEQS="4"
+    EXTRA_ARGS=""
+
+    # User-configurable settings
+    echo ""
+    read -r -p "Max context length [196608]: " ctx_input
+    CONTEXT="${ctx_input:-196608}"
+    if ! validate_numeric "$CONTEXT" "Context length"; then exit 1; fi
+
+    read -r -p "GPU memory utilization (0.0-1.0) [0.85]: " GPU_UTIL
+    GPU_UTIL="${GPU_UTIL:-0.85}"
+
+    read -r -p "Port [$TURBO_DEFAULT_PORT]: " PORT
+    PORT="${PORT:-$TURBO_DEFAULT_PORT}"
+    if ! validate_numeric "$PORT" "Port"; then exit 1; fi
+
+    MODEL_ALIAS="qwen3.6-27b"
+    read -r -p "Model alias for API [$MODEL_ALIAS]: " alias_input
+    MODEL_ALIAS="${alias_input:-$MODEL_ALIAS}"
+
+    echo ""
+    log_info "Turbo configuration:"
+    echo "  Model:       $HF_MODEL"
+    echo "  Context:     $CONTEXT"
+    echo "  TP:          2 GPUs (fixed)"
+    echo "  Max seqs:    4 (fixed)"
+    echo "  GPU util:    $GPU_UTIL"
+    echo "  KV cache:    turboquant_3bit_nc"
+    echo "  MTP:         n=3 speculative tokens"
+    echo "  Port:        $PORT"
+    echo "  Alias:       $MODEL_ALIAS"
 }
 
 # ─── Docker Mode ──────────────────────────────────────────────────────────────
@@ -379,12 +459,84 @@ stop_native() {
     rm -f "$PORT_FILE"
 }
 
+# ─── Turbo Mode (club-3090 Docker + Genesis + TurboQuant) ─────────────────
+start_turbo() {
+    require_command docker "Install Docker: https://docs.docker.com/engine/install/"
+    require_command git "Install git: sudo apt install git"
+
+    local club_repo="$HOME/club-3090"
+    local model_dir="$HOME/models"
+    local model_path="$model_dir/qwen3.6-27b-autoround-int4"
+    local genesis_path="$club_repo/models/qwen3.6-27b/vllm/patches/genesis/vllm/_genesis"
+    local compose_dir="$TURBO_COMPOSE_DIR"
+
+    # Check club-3090 repo
+    if [[ ! -d "$club_repo" ]]; then
+        log_info "Cloning club-3090 repository..."
+        git clone https://github.com/club-3090/club-3090.git "$club_repo"
+    fi
+
+    # Check Genesis patches
+    if [[ ! -d "$genesis_path" ]]; then
+        log_info "Genesis patches not found. Running setup..."
+        (cd "$club_repo" && bash scripts/setup.sh qwen3.6-27b)
+    fi
+
+    # Check model
+    if [[ ! -d "$model_path" ]]; then
+        log_info "Model not found at $model_path"
+        log_info "Downloading Lorbus/Qwen3.6-27B-int4-AutoRound via setup.sh..."
+        (cd "$club_repo" && MODEL_DIR="$model_dir" bash scripts/setup.sh qwen3.6-27b)
+    fi
+
+    # Stop existing turbo container
+    if docker ps -a --format '{{.Names}}' | grep -q "^${TURBO_CONTAINER_NAME}$"; then
+        log_info "Removing existing turbo container..."
+        (cd "$compose_dir" && docker compose -f "$TURBO_COMPOSE_FILE" down 2>/dev/null) || \
+            docker rm -f "$TURBO_CONTAINER_NAME" > /dev/null 2>&1
+        sleep 2
+    fi
+
+    # Create .env file for compose
+    log_info "Writing compose .env file..."
+    cat > "$compose_dir/.env" <<ENVEOF
+HF_TOKEN=${HF_TOKEN:-}
+MODEL_DIR=${model_dir}
+PORT=${PORT}
+GPU_MEMORY_UTILIZATION=${GPU_UTIL}
+MAX_MODEL_LEN=${CONTEXT}
+ENVEOF
+
+    # Start via docker compose
+    echo ""
+    log_step "Starting TurboQuant container..."
+    (cd "$compose_dir" && docker compose -f "$TURBO_COMPOSE_FILE" up -d) 2>&1
+
+    echo "$PORT" > "$PORT_FILE"
+    save_config
+}
+
+stop_turbo() {
+    local compose_dir="$TURBO_COMPOSE_DIR"
+    if docker ps -a --format '{{.Names}}' | grep -q "^${TURBO_CONTAINER_NAME}$"; then
+        if [[ -d "$compose_dir" && -f "$compose_dir/$TURBO_COMPOSE_FILE" ]]; then
+            (cd "$compose_dir" && docker compose -f "$TURBO_COMPOSE_FILE" down) 2>/dev/null || true
+        else
+            docker stop "$TURBO_CONTAINER_NAME" > /dev/null 2>&1
+            docker rm "$TURBO_CONTAINER_NAME" > /dev/null 2>&1
+        fi
+    fi
+    rm -f "$PORT_FILE"
+}
+
 # ─── Detect mode ──────────────────────────────────────────────────────────────
 detect_mode() {
     if [[ -f "$CONFIG_FILE" ]]; then
         # shellcheck source=/dev/null
         source "$CONFIG_FILE"
         echo "${VLLM_MODE:-docker}"
+    elif docker ps --format '{{.Names}}' 2>/dev/null | grep -q "^${TURBO_CONTAINER_NAME}$"; then
+        echo "turbo"
     elif docker ps --format '{{.Names}}' 2>/dev/null | grep -q "^${CONTAINER_NAME}$"; then
         echo "docker"
     elif systemctl is-active --quiet "$SERVICE_NAME" 2>/dev/null; then
@@ -396,21 +548,28 @@ detect_mode() {
 
 # ─── Unified Commands ────────────────────────────────────────────────────────
 start_server() {
-    gather_config
-
-    # Ask for run mode if not specified
+    # Ask for run mode if not specified via flag
     if [[ -z "$RUN_MODE" ]]; then
         echo ""
         echo "Run mode:"
-        echo "  1) Docker  — containerized, no dependency management (recommended)"
+        echo "  1) Docker  — containerized, generic vLLM image (recommended)"
         echo "  2) Native  — pip-installed vLLM, requires manual setup"
+        echo "  3) Turbo   — club-3090 Docker + Genesis patches + TurboQuant KV + MTP (recommended for RTX 3090)"
         read -r -p "Select run mode [1]: " mode_choice
         mode_choice="${mode_choice:-1}"
         case "$mode_choice" in
             1) RUN_MODE="docker" ;;
             2) RUN_MODE="native" ;;
+            3) RUN_MODE="turbo" ;;
             *) log_error "Invalid choice"; exit 1 ;;
         esac
+    fi
+
+    # Gather config based on mode
+    if [[ "$RUN_MODE" == "turbo" ]]; then
+        gather_turbo_config
+    else
+        gather_config
     fi
 
     echo ""
@@ -418,8 +577,10 @@ start_server() {
     echo "  Model:     $HF_MODEL"
     echo "  Alias:     $MODEL_ALIAS"
     echo "  Context:   $CONTEXT"
-    echo "  TP:        $TP_SIZE GPUs"
-    echo "  Max seqs:  $MAX_SEQS"
+    if [[ "$RUN_MODE" != "turbo" ]]; then
+        echo "  TP:        $TP_SIZE GPUs"
+        echo "  Max seqs:  $MAX_SEQS"
+    fi
     echo "  Port:      $PORT"
     echo "  Mode:      $RUN_MODE"
     echo ""
@@ -427,16 +588,19 @@ start_server() {
     case "$RUN_MODE" in
         docker) start_docker ;;
         native) start_native ;;
+        turbo)  start_turbo ;;
     esac
 
     # Wait for health
     log_info "Waiting for vLLM to load model (this can take a few minutes)..."
     local wait_secs=5 max_wait=600 elapsed=0
+    local check_container="$CONTAINER_NAME"
+    [[ "$RUN_MODE" == "turbo" ]] && check_container="$TURBO_CONTAINER_NAME"
 
     while [[ "$elapsed" -lt "$max_wait" ]]; do
         # Check if process died
-        if [[ "$RUN_MODE" == "docker" ]]; then
-            if ! docker ps --format '{{.Names}}' | grep -q "^${CONTAINER_NAME}$"; then
+        if [[ "$RUN_MODE" == "docker" || "$RUN_MODE" == "turbo" ]]; then
+            if ! docker ps --format '{{.Names}}' | grep -q "^${check_container}$"; then
                 echo ""
                 log_error "Container exited. Check logs: $0 logs"
                 exit 1
@@ -457,6 +621,8 @@ start_server() {
 
             if [[ "$RUN_MODE" == "docker" ]]; then
                 log_info "Logs: docker logs -f $CONTAINER_NAME"
+            elif [[ "$RUN_MODE" == "turbo" ]]; then
+                log_info "Logs: docker logs -f $TURBO_CONTAINER_NAME"
             else
                 log_info "Logs: journalctl -u $SERVICE_NAME -f"
             fi
@@ -494,6 +660,7 @@ stop_server() {
     case "$mode" in
         docker) stop_docker ;;
         native) stop_native ;;
+        turbo)  stop_turbo ;;
     esac
 
     rm -f "$CONFIG_FILE"
@@ -521,6 +688,9 @@ show_status() {
     if [[ "$mode" == "docker" ]]; then
         log_success "vLLM server: running (Docker container: $CONTAINER_NAME)"
         docker ps --filter "name=$CONTAINER_NAME" --format "  Image: {{.Image}}\n  Status: {{.Status}}\n  Ports: {{.Ports}}"
+    elif [[ "$mode" == "turbo" ]]; then
+        log_success "vLLM server: running (Turbo container: $TURBO_CONTAINER_NAME)"
+        docker ps --filter "name=$TURBO_CONTAINER_NAME" --format "  Image: {{.Image}}\n  Status: {{.Status}}\n  Ports: {{.Ports}}"
     else
         log_success "vLLM server: running (systemd service: $SERVICE_NAME)"
         local enabled="disabled"
@@ -572,6 +742,9 @@ show_logs() {
     case "$mode" in
         docker)
             docker logs --tail 50 "$CONTAINER_NAME" 2>&1
+            ;;
+        turbo)
+            docker logs --tail 50 "$TURBO_CONTAINER_NAME" 2>&1
             ;;
         native)
             journalctl -u "$SERVICE_NAME" -n 50 --no-pager
@@ -625,6 +798,12 @@ register_with_new_api() {
         gateway_ip=$(docker network inspect new-api_new-api-network 2>/dev/null | \
             python3 -c "import json,sys; print(json.load(sys.stdin)[0]['IPAM']['Config'][0]['Gateway'])" 2>/dev/null || echo "172.17.0.1")
 
+        # For turbo mode, the backend model name differs from the alias
+        local model_mapping=""
+        if [[ "${RUN_MODE:-}" == "turbo" ]]; then
+            model_mapping='{"qwen3.6-27b":"qwen3.6-27b-autoround"}'
+        fi
+
         local resp
         resp=$(curl -s -b "$cookie_jar" "http://127.0.0.1:${na_port}/api/channel/" \
             -H "New-Api-User: $admin_id" \
@@ -638,7 +817,7 @@ register_with_new_api() {
                     \"key\": \"no-key-needed\",
                     \"base_url\": \"http://${gateway_ip}:${PORT}\",
                     \"models\": \"$MODEL_ALIAS\",
-                    \"model_mapping\": \"\",
+                    \"model_mapping\": \"${model_mapping}\",
                     \"group\": \"default,vip,svip\",
                     \"priority\": 1,
                     \"status\": 1,
@@ -670,6 +849,7 @@ for arg in "$@"; do
     case "$arg" in
         --docker) RUN_MODE="docker" ;;
         --native) RUN_MODE="native" ;;
+        --turbo) RUN_MODE="turbo" ;;
         start|stop|restart|status|logs)
             ACTION="$arg" ;;
         *)
